@@ -1,0 +1,84 @@
+---
+title: "Exploratory Data Analysis"
+output: html_notebook
+---
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+```
+
+# Data Set Information
+
+Basketball Reference's WNBA per-100-possession data for the seasons 1997 to 2024
+
+| Stat   | Description                                                      |
+|-----------------------------------------|-------------------------------|
+| Player | Player Name                                                    |
+| Team   | Team |
+| G      | Games |
+| MP     | Minutes Played |
+| GS     | Games Started |
+| FG     | Field Goals (includes both 2-point and 3-point field goals)      |
+| FGA    | Field Goal Attempts (includes both 2-point and 3-point attempts) |
+| FG%    | Field Goal Percentage; formula: FG / FGA.                        |
+| 3P     | 3-Point Field Goals                                              |
+| 3P%    | 3-Point Field Goal Percentage; the formula is 3P / 3PA.          |
+| 3PA    | 3-Point Field Goal Attempts                                      |
+| 2P     | 2-Point Field Goals                                              |
+| 2PA    | 2-Point Field Goal Attempts                                      |
+| 2P%    | 2-Point Field Goal Percentage; the formula is 2P / 2PA.          |
+| FT     | Free Throws                                                      |
+| FT%    | Free Throw Percentage; formula: FT / FTA.                        |
+| FTA    | Free Throw Attempts                                              |
+| ORB    | Offensive Rebounds                                               |
+| TRB    | Total Rebounds                                                   |
+| AST    | Assists                                                          |
+| STL    | Steals                                                           |
+| BLK    | Blocks                                                           |
+| TOV    | Turnovers                                                        |
+| PF     | Personal Fouls                                                   |
+| PTS    | Points                                                           |
+| Season | Season Start Year                                                |
+
+```{r}
+script_dir <- getwd()
+data_directory <- file.path(script_dir, 'data')
+file_path <- file.path(data_directory, 'per_100.csv')
+df <- read.csv(file_path)
+
+# Get the Shape
+df_shape <- dim(df)
+print(paste("Number of rows:", df_shape[1]))
+print(paste("Number of columns:", df_shape[2]))
+
+# List the available columns
+columns <- colnames(df)
+print("Columns:")
+print(columns)
+```
+```{r}
+# Check if those two columns that seem repeated are
+
+similarity_g <- sum(df[, "G"] == df[, "G.1"])/length(df[, "G"])
+similarity_mp <- sum(df[, "MP"] == df[, "MP.1"])/length(df[, "MP"])
+
+if (similarity_g > 0.9) {
+  print(paste("Columns G and G.1 are", round(similarity_g * 100, 2), "% identical"))
+  df <- df[, -which(colnames(df) == "G.1")]
+}
+
+if (similarity_mp > 0.9) {
+  print(paste("Columns MP and MP.1 are", round(similarity_mp * 100, 2), "% identical"))
+  df <- df[, -which(colnames(df) == "MP.1")]
+}
+
+columns <- colnames(df)
+print("New Columns:")
+print(columns)
+
+```
+
+
+
