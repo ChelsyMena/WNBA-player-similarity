@@ -1,25 +1,33 @@
 ---
-title: "Exploratory Data Analysis"
+title: "WNBA Player Similarity"
 output: html_notebook
 ---
 
 ```{r}
 # Load necessary libraries
 library(dplyr)
-
+library(ggplot2)
+library(plotly)
+library(GGally)
+library(gridExtra)
+library(corrplot)
+library(Rtsne)
 ```
 
-# Data Set Information
+# Exploratory Data Analysis
+
+## Data Set Information
 
 Basketball Reference's WNBA per-100-possession data for the seasons 1997 to 2024
 
 | Stat   | Description                                                      |
-|-----------------------------------------|-------------------------------|
-| Player | Player Name                                                    |
-| Team   | Team |
-| G      | Games |
-| MP     | Minutes Played |
-| GS     | Games Started |
+|-----------------------------|-------------------------------------------|
+| Player | Player Name                                                      |
+| Team   | Team                                                             |
+| Pos    | Position                                                         |
+| G      | Games                                                            |
+| MP     | Minutes Played                                                   |
+| GS     | Games Started                                                    |
 | FG     | Field Goals (includes both 2-point and 3-point field goals)      |
 | FGA    | Field Goal Attempts (includes both 2-point and 3-point attempts) |
 | FG%    | Field Goal Percentage; formula: FG / FGA.                        |
@@ -58,6 +66,21 @@ columns <- colnames(df)
 print("Columns:")
 print(columns)
 ```
+
+```{r}
+# Number of unique players
+unique_players <- length(unique(df$Player))
+print(paste("Number of unique players:", unique_players))
+
+# Number of players per position
+positions <- unique(df$Pos)
+players_per_position <- sapply(positions, function(pos) sum(df$Pos == pos))
+print("Players per Position:")
+print(players_per_position)
+```
+
+## Data Pre-Processing
+
 ```{r}
 # Check if those two columns that seem repeated are
 
@@ -77,8 +100,245 @@ if (similarity_mp > 0.9) {
 columns <- colnames(df)
 print("New Columns:")
 print(columns)
-
 ```
 
+```{r}
+# column types
+column_types <- sapply(df, class)
+print("Column Types:")
+print(column_types)
 
+# make season text
+df$Season <- as.character(df$Season)
+
+# missing values
+missing_values <- sum(is.na(df))
+print(paste(" Total Missing Values:", missing_values))
+```
+
+```{r}
+# missing values by column
+missing_values_by_column <- colSums(is.na(df))
+print("Missing Values by Column:")
+print(missing_values_by_column)
+```
+
+```{r}
+df_na <- df[is.na(df$FG),]
+print("Rows with NA in FG column:")
+print(df_na)
+```
+
+We can confidently drop these rows, as it seems it's simply players that did not play that year. Possibly due to injury or other reasons.
+
+```{r}
+df <- df[!df$MP == 0,]
+
+df_na <- df[is.na(df$FG.),]
+print("Rows with NA in FG. column:")
+print(df_na)
+```
+
+As we can see, that column is empty when the player did not attempt any field goals that year. Similarly for the 2, 3 points ones and the free throws. We'll input 0 for these cases.
+
+```{r}
+df$FG.[is.na(df$FG.) & df$FGA == 0] <- 0
+df$X3P.[is.na(df$X3P.) & df$X3PA == 0] <- 0
+df$X2P.[is.na(df$X2P.) & df$X2PA == 0] <- 0
+df$FT.[is.na(df$FT.) & df$FTA == 0] <- 0
+
+
+missing_values_by_column <- colSums(is.na(df))
+print("Final Missing Values by Column:")
+print(missing_values_by_column)
+
+df_shape <- dim(df)
+print("Final Shape:")
+print(paste("Rows:", df_shape[1]))
+print(paste("Columns:", df_shape[2]))
+```
+
+```{r}
+# Check for duplicates
+duplicates <- df[duplicated(df),]
+print("Number of Duplicates:")
+print(dim(duplicates)[1])
+```
+
+## Variable Distribution
+
+```{r}
+plot_distribution <- function(df, column, bins) {
+  p1 <- ggplot(df, aes_string(x = column)) + 
+    geom_histogram(bins = bins, fill = "#E15101", alpha = 0.7) + 
+    labs(title = paste("Distribution of", column)) +
+    theme(plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  
+  p2 <- ggplot(df, aes_string(y = column)) + 
+    geom_boxplot(fill = "#E15101", alpha = 0.7) + coord_flip() +
+    theme(plot.margin = unit(c(0, 1, 0, 2.1), "cm"), 
+          axis.ticks.y = element_blank(), axis.text.y = element_blank()) #+ 
+    #labs(title = paste("Boxplot of", column))
+  
+  
+  grid.arrange(p1, p2, ncol = 1, heights = c(3, 1))
+}
+
+# Loop through columns and create plots for numeric columns
+for (col in colnames(df)) {
+  if (is.numeric(df[[col]])) {
+    bins <- ifelse(grepl("\\.", col), 10, 27)
+    plot_distribution(df, col, bins)
+  }
+}
+```
+
+# Modelling
+
+## Feature Engineering & Selection
+
+```{r}
+correlation_matrix <- cor(df[, sapply(df, is.numeric)], use = "complete.obs")
+print("Correlation Matrix:")
+corrplot(correlation_matrix, method = "color", tl.col = "black", tl.srt = 45,  tl.cex = 0.7)
+```
+
+As expected, the field goals and each type of shot attempted and made is correlated with its made percentage. And the number of games played is correlated with the games started and minutes played, and the total and offensive rebounds as well. It's interesting to note there is a slight negative correlation between rebounds and 3-point shooting, a good clue that we can find some pointers of position by the strong starts per player.
+
+```{r}
+high_correlations <- which(abs(correlation_matrix) > 0.8 & abs(correlation_matrix) < 1, arr.ind = TRUE)
+
+# Print the high correlations
+if (length(high_correlations) > 0) {
+  for (i in 1:nrow(high_correlations)) {
+    row <- high_correlations[i, 1]
+    col <- high_correlations[i, 2]
+    cat(sprintf("Correlation between %s and %s: %.2f\n", 
+                rownames(correlation_matrix)[row], 
+                colnames(correlation_matrix)[col], 
+                correlation_matrix[row, col]))
+  }
+} else {
+  print("No correlations greater than 80% found.")
+}
+```
+
+For this project it's important to differentiate between the different types of shooting, 2-point, 3-point and free throws, and we will keep the offensive and obtain the defensive rebounds, as well as the other defensive stats; and the total points. It's important to remember these stats are already somewhat normalized, since they are the stats per 100 possessions.
+
+```{r}
+df <- df %>%
+  mutate(DRB = TRB - ORB)
+
+columns_to_keep <- c("Player", "Team", "Season", "Pos", "X3PA", "X3P.","X2PA", "X2P.", "FTA", "FT.", 'PTS', "ORB", "DRB", "AST", "STL", "BLK", "TOV", "PF")
+df <- df %>% select(all_of(columns_to_keep))
+
+columns <- colnames(df)
+print("Columns:")
+print(columns)
+```
+
+```{r}
+# save df to a csv
+write.csv(df, file = file.path(data_directory, "wnba_cleaned.csv"), row.names = FALSE)
+```
+
+## PCA Implementation
+
+```{r}
+remove_outliers <- function(df) {
+  numeric_columns <- sapply(df, is.numeric)
+  for (col in names(df)[numeric_columns]) {
+    Q1 <- quantile(df[[col]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(df[[col]], 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - 1.2 * IQR
+    upper_bound <- Q3 + 1.2 * IQR
+    df <- df[df[[col]] >= lower_bound & df[[col]] <= upper_bound, ]
+  }
+  return(df)
+}
+
+df_no_outliers <- remove_outliers(df)
+print("Remaining data points:")
+dim(df_no_outliers)
+```
+
+```{r}
+# Perform PCA
+numeric_cols <- sapply(df_no_outliers, is.numeric)
+pca_result <- prcomp(df_no_outliers[, numeric_cols], scale. = TRUE)
+
+summary(pca_result)
+```
+
+```{r}
+# Plot PCA results
+pca_data <- as.data.frame(pca_result$x)
+pca_data$Player <- df_no_outliers$Player
+pca_data$Pos <- df_no_outliers$Pos
+
+ggplot(pca_data, 
+       aes(x = PC1, y = PC2, color = Pos, label = Player)) +
+  geom_point(alpha = 0.7) +
+  #geom_text(size = 2, vjust = 1.5) +
+  labs(title = "PCA of WNBA Player Stats", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+The two principal components explain 55% of the variance, which is not ideal, but it's a good start. And we can see some clear zones for some of the positions with the first two, Guards are to the left, Forwards in the middle and Centers scattered but mostly right. It's not perfect, probably because the positions are defined in a mixed way.
+
+```{r}
+# 3D scatter plot
+plot_ly(pca_data, x = ~PC1, y = ~PC2, z = ~PC3, color = ~Pos, 
+        type = "scatter3d", mode = "markers", marker = list(size = 3)) %>%
+  layout(title = "3D PCA of WNBA Player Stats",
+         scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+```
+
+## t-SNE
+
+```{r}
+df_unique <- pca_data
+df_unique$Player <- pca_data$Player
+df_unique$Pos <- pca_data$Pos
+df_unique <- df_unique[!duplicated(df_unique),]
+
+# Perform t-SNE
+set.seed(42)
+tsne_result <- Rtsne(
+  df_unique, dims = 3, perplexity = 30, verbose = TRUE, max_iter = 500
+  )
+
+tsne_data <- as.data.frame(tsne_result$Y)
+tsne_data$Player <- df_unique$Player
+tsne_data$Pos<- df_unique$Pos
+
+print("t-SNE Data Size:")
+print(dim(tsne_data))
+```
+
+```{r}
+# Create a 2D scatter plot
+ggplot(tsne_data, aes(x = V1, y = V2, color = Pos, label = Player)) +
+  geom_point(alpha = 0.7) +
+  #geom_text(size = 2, vjust = 1.5) +
+  labs(title = "t-SNE of WNBA Player Stats", x = "Dimension 1", y = "Dimension 2") +
+  theme_minimal()
+```
+
+```{r}
+# Create a 3D scatter plot
+plot_ly(tsne_data, x = ~V1, y = ~V2, z = ~V3, color = ~Pos, 
+        type = "scatter3d", mode = "markers", marker = list(size = 3)) %>%
+  layout(title = "3D PCA of WNBA Player Stats",
+         scene = list(xaxis = list(title = 'Dim 1'),
+                      yaxis = list(title = 'Dim 2'),
+                      zaxis = list(title = 'Dim 3')))
+```
+
+As we can see, chaining these two methods of dimensionality reduction we can see a clearer separation of the positions, The guards occupy a clear region, and the Forwards another, with a interface in the middle for those labeled Guard-Forward, even when it if generally known that between-cluster similarities are not guaranteed in t-SNE.
+
+## Clustering Analysis
 
