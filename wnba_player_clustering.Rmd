@@ -1,0 +1,1072 @@
+---
+title: "WNBA Player Similarity"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+# Necessary libraries
+library(dplyr)
+
+library(ggplot2)
+library(plotly)
+library(GGally)
+library(gridExtra)
+library(corrplot)
+
+library(Rtsne)
+library(caret)
+
+library(dbscan)
+library(cluster)
+
+library(dendextend)
+
+library(mclust)
+
+library(pheatmap)
+library(aricode)
+```
+
+# Exploratory Data Analysis
+
+## Data Set Information
+
+Basketball Reference's WNBA per-100-possession data for the seasons 1997 to 2024
+
+| Stat   | Description                                                      |
+|-----------------------------|-------------------------------------------|
+| Player | Player Name                                                      |
+| Team   | Team                                                             |
+| Pos    | Position                                                         |
+| G      | Games                                                            |
+| MP     | Minutes Played                                                   |
+| GS     | Games Started                                                    |
+| FG     | Field Goals (includes both 2-point and 3-point field goals)      |
+| FGA    | Field Goal Attempts (includes both 2-point and 3-point attempts) |
+| FG%    | Field Goal Percentage; formula: FG / FGA.                        |
+| 3P     | 3-Point Field Goals                                              |
+| 3P%    | 3-Point Field Goal Percentage; the formula is 3P / 3PA.          |
+| 3PA    | 3-Point Field Goal Attempts                                      |
+| 2P     | 2-Point Field Goals                                              |
+| 2PA    | 2-Point Field Goal Attempts                                      |
+| 2P%    | 2-Point Field Goal Percentage; the formula is 2P / 2PA.          |
+| FT     | Free Throws                                                      |
+| FT%    | Free Throw Percentage; formula: FT / FTA.                        |
+| FTA    | Free Throw Attempts                                              |
+| ORB    | Offensive Rebounds                                               |
+| TRB    | Total Rebounds                                                   |
+| AST    | Assists                                                          |
+| STL    | Steals                                                           |
+| BLK    | Blocks                                                           |
+| TOV    | Turnovers                                                        |
+| PF     | Personal Fouls                                                   |
+| PTS    | Points                                                           |
+| Season | Season Start Year                                                |
+
+```{r}
+script_dir <- getwd()
+data_directory <- file.path(script_dir, 'data')
+file_path <- file.path(data_directory, 'per_100.csv')
+data <- read.csv(file_path)
+
+data_shape <- dim(data)
+print(paste("Number of rows:", data_shape[1]))
+print(paste("Number of columns:", data_shape[2]))
+
+columns <- colnames(data)
+print("Columns:")
+print(columns)
+```
+
+```{r}
+unique_players <- length(unique(data$Player))
+print(paste("Number of unique players:", unique_players))
+
+positions <- unique(data$Pos)
+players_per_position <- sapply(positions, function(pos) sum(data$Pos == pos))
+print("Players per Position:")
+print(players_per_position)
+```
+
+## Data Pre-Processing
+
+```{r}
+data$Pos <- gsub("G-F", "F-G", data$Pos)
+data$Pos <- gsub("C-F", "F-C", data$Pos)
+# data$Pos <- substr(data$Pos, 1, 1)
+
+players_per_position <- sapply(positions, function(pos) sum(data$Pos == pos))
+print("Players per Position:")
+print(players_per_position)
+```
+
+```{r}
+similarity_g <- sum(data[, "G"] == data[, "G.1"])/length(data[, "G"])
+similarity_mp <- sum(data[, "MP"] == data[, "MP.1"])/length(data[, "MP"])
+
+if (similarity_g > 0.9) {
+  print(paste("Columns G and G.1 are", round(similarity_g * 100, 2), "% identical"))
+  data <- data[, -which(colnames(data) == "G.1")]
+}
+
+if (similarity_mp > 0.9) {
+  print(paste("Columns MP and MP.1 are", round(similarity_mp * 100, 2), "% identical"))
+  data <- data[, -which(colnames(data) == "MP.1")]
+}
+
+columns <- colnames(data)
+print("New Columns:")
+print(columns)
+```
+
+```{r}
+column_types <- sapply(data, class)
+print("Column Types:")
+print(column_types)
+
+data$Season <- as.character(data$Season)
+
+missing_values <- sum(is.na(data))
+print(paste(" Total Missing Values:", missing_values))
+```
+
+```{r}
+missing_values_by_column <- colSums(is.na(data))
+print("Missing Values by Column:")
+print(missing_values_by_column)
+```
+
+```{r}
+data_na <- data[is.na(data$FG),]
+print("Rows with NA in FG column:")
+print(data_na)
+```
+
+We can confidently drop these rows, as it seems it's simply players that did not play that year. Possibly due to injury or other reasons.
+
+```{r}
+data <- data[!data$MP == 0,]
+
+data_na <- data[is.na(data$FG.),]
+print("Rows with NA in FG. column:")
+print(data_na)
+```
+
+As we can see, that column is empty when the player did not attempt any field goals that year. Similarly for the 2, 3 points ones and the free throws. We'll input 0 for these cases.
+
+```{r}
+data$FG.[is.na(data$FG.) & data$FGA == 0] <- 0
+data$X3P.[is.na(data$X3P.) & data$X3PA == 0] <- 0
+data$X2P.[is.na(data$X2P.) & data$X2PA == 0] <- 0
+data$FT.[is.na(data$FT.) & data$FTA == 0] <- 0
+
+missing_values_by_column <- colSums(is.na(data))
+print("Final Missing Values by Column:")
+print(missing_values_by_column)
+
+data_shape <- dim(data)
+print("Final Shape:")
+print(paste("Rows:", data_shape[1]))
+print(paste("Columns:", data_shape[2]))
+```
+
+```{r}
+duplicates <- data[duplicated(data),]
+print("Number of Duplicates:")
+print(dim(duplicates)[1])
+```
+
+## Variable Distribution
+
+```{r}
+plot_distribution <- function(data, column, bins) {
+  p1 <- ggplot(data, aes_string(x = column)) + 
+    geom_histogram(bins = bins, fill = "#E15101", alpha = 0.7) + 
+    labs(title = paste("Distribution of", column)) +
+    theme(plot.margin = unit(c(1, 1, 1, 1), "cm"))
+  
+  p2 <- ggplot(data, aes_string(y = column)) + 
+    geom_boxplot(fill = "#E15101", alpha = 0.7) + coord_flip() +
+    theme(plot.margin = unit(c(0, 1, 0, 2.1), "cm"), 
+          axis.ticks.y = element_blank(), axis.text.y = element_blank())
+  
+  grid.arrange(p1, p2, ncol = 1, heights = c(3, 1))
+}
+
+for (col in colnames(data)) {
+  if (is.numeric(data[[col]])) {
+    bins <- ifelse(grepl("\\.", col), 10, 27)
+    plot_distribution(data, col, bins)
+  }
+}
+```
+
+# Modelling
+
+## Feature Engineering & Selection
+
+```{r}
+correlation_matrix <- cor(data[, sapply(data, is.numeric)], use = "complete.obs")
+print("Correlation Matrix:")
+corrplot(correlation_matrix, method = "color", tl.col = "black", tl.srt = 45,  tl.cex = 0.7)
+```
+
+As expected, the field goals and each type of shot attempted and made is correlated with its made percentage. And the number of games played is correlated with the games started and minutes played, and the total and offensive rebounds as well. It's interesting to note there is a slight negative correlation between rebounds and 3-point shooting, a good clue that we can find some pointers of position by the strong starts per player.
+
+```{r}
+high_correlations <- which(abs(correlation_matrix) > 0.8 & abs(correlation_matrix) < 1, arr.ind = TRUE)
+
+if (length(high_correlations) > 0) {
+  for (i in 1:nrow(high_correlations)) {
+    row <- high_correlations[i, 1]
+    col <- high_correlations[i, 2]
+    cat(sprintf("Correlation between %s and %s: %.2f\n", 
+                rownames(correlation_matrix)[row], 
+                colnames(correlation_matrix)[col], 
+                correlation_matrix[row, col]))
+  }
+} else {
+  print("No correlations greater than 80% found.")
+}
+```
+
+For this project it's important to differentiate between the different types of shooting, 2-point, 3-point and free throws, and we will keep the offensive and obtain the defensive rebounds, as well as the other defensive stats; and the total points. It's important to remember these stats are already somewhat normalized, since they are the stats per 100 possessions.
+
+```{r}
+data <- data %>%
+  mutate(DRB = TRB - ORB)
+
+columns_to_keep <- c("Player", "Team", "Season", "Pos", "X3PA", "X3P.","X2PA", "X2P.", "FTA", "FT.", 'PTS', "ORB", "DRB", "AST", "STL", "BLK", "TOV", "PF")
+data <- data %>% select(all_of(columns_to_keep))
+
+columns <- colnames(data)
+print("Columns:")
+print(columns)
+```
+
+```{r}
+# save data to a csv
+# write.csv(data, file = file.path(data_directory, "wnba_cleaned.csv"), row.names = FALSE)
+```
+
+## PCA Implementation
+
+```{r}
+remove_outliers <- function(data) {
+  numeric_columns <- sapply(data, is.numeric)
+  for (col in names(data)[numeric_columns]) {
+    Q1 <- quantile(data[[col]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(data[[col]], 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    data <- data[data[[col]] >= lower_bound & data[[col]] <= upper_bound, ]
+  }
+  return(data)
+}
+
+data_no_outliers <- remove_outliers(data)
+print("Remaining data points:")
+dim(data_no_outliers)
+```
+
+```{r}
+# Perform PCA
+numeric_cols <- sapply(data_no_outliers, is.numeric)
+pca_result <- prcomp(data_no_outliers[, numeric_cols], scale. = TRUE)
+
+summary(pca_result)
+```
+
+```{r}
+
+var_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+cumvar_explained <- cumsum(var_explained)
+
+pca_var <- data.frame(
+  PC = 1:length(var_explained),
+  var_explained = var_explained,
+  cum_var = cumvar_explained
+)
+
+p1 <- ggplot(pca_var, aes(x = PC, y = var_explained)) +
+  geom_col(fill = "#E15101", alpha = 0.7) +
+  geom_line(aes(y = cum_var), color = "#2e86c1", size = 1.5) +
+  geom_point(aes(y = cum_var), color = "#2e86c1", size = 3) +
+  geom_text(aes(y = cum_var, label = sprintf("%.2f", cum_var)), 
+            vjust = -0.8, 
+            hjust = 0.5, 
+            size = 7) + 
+  scale_y_continuous(
+    name = "Proportion of Variance Explained",
+    sec.axis = sec_axis(~., name = "Cumulative Proportion")
+  ) +
+  labs(x = "Principal Component") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 14),   # Axis numbers
+    axis.title = element_text(size = 16),  # Axis titles
+    plot.title = element_text(size = 22),  # Plot title
+    aspect.ratio = 9/16                    # Force 16:9 aspect ratio
+  )
+
+print(p1)
+
+#ggsave("figures/pca_scree.pdf", p1, width = 16, height = 9, units = "in")
+```
+
+```{r}
+# Plot PCA results
+data_pca <- as.data.frame(pca_result$x)
+data_pca$Player <- data_no_outliers$Player
+data_pca$Pos <- data_no_outliers$Pos
+
+ggplot(data_pca, 
+       aes(x = PC1, y = PC2, color = Pos, label = Player)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "PCA of WNBA Player Stats", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal()
+```
+
+The two principal components explain 55% of the variance, which is not ideal, but it's a good start. And we can see some clear zones for some of the positions with the first two, Guards are to the left, Forwards and Centers scattered but mostly right.
+
+```{r}
+# 3D scatter plot
+plot_ly(data_pca, x = ~PC1, y = ~PC2, z = ~PC3, color = ~Pos, 
+        type = "scatter3d", mode = "markers", marker = list(size = 3)) %>%
+  layout(title = "3D PCA of WNBA Player Stats",
+         scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+```
+
+## t-SNE
+
+```{r}
+data_unique <- data_pca
+data_unique$Player <- data_pca$Player
+data_unique$Pos <- data_pca$Pos
+data_unique <- data_unique[!duplicated(data_unique),]
+
+# Perform t-SNE
+set.seed(42)
+tsne_result <- Rtsne(
+  data_unique, dims = 3, perplexity = 30, verbose = TRUE, max_iter = 500
+  )
+
+data_tsne <- as.data.frame(tsne_result$Y)
+data_tsne$Player <- data_unique$Player
+data_tsne$Pos<- data_unique$Pos
+
+print("t-SNE Data Size:")
+print(dim(data_tsne))
+```
+
+```{r}
+# Create a 2D scatter plot
+ggplot(data_tsne, aes(x = V1, y = V2, color = Pos, label = Player)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "t-SNE of WNBA Player Stats",
+       x = "Dimension 1", y = "Dimension 2") +
+  theme_minimal()
+```
+
+```{r}
+# Create a 3D scatter plot
+plot_ly(data_tsne, x = ~V1, y = ~V2, z = ~V3, color = ~Pos, 
+        type = "scatter3d", mode = "markers", marker = list(size = 2)) %>%
+  layout(#title = "t-SNE of WNBA Player Stats",
+         scene = list(xaxis = list(title = 'Dim 1'),
+                      yaxis = list(title = 'Dim 2'),
+                      zaxis = list(title = 'Dim 3')))
+```
+
+As we can see, chaining these two methods of dimensionality reduction we can see a clearer separation of the positions, The guards occupy a clear region, and the Forwards another, with the centers at the end of the cluster mixed in. 
+
+## Clustering
+
+We will attempt to retrieve the positions from the stats, to see if there is such a thing as a style of play corresponding to the labeled positions. We will do so using the original data, and the one reduced and transformed through t-SNE.
+
+### K-Means
+
+```{r}
+calculate_wss <- function(data, k) {
+  kmeans_result <- kmeans(data, centers = k, nstart = 25)
+  return(kmeans_result$tot.withinss)
+}
+
+cross_validate_kmeans <- function(data, k_values, folds = 5) {
+  set.seed(42)
+  fold_indices <- createFolds(data[, 1], k = folds, list = TRUE, returnTrain = TRUE)
+  wss_values <- sapply(k_values, function(k) {
+    fold_wss <- sapply(fold_indices, function(indices) {
+      train_data <- data[indices, ]
+      calculate_wss(train_data, k)
+    })
+    mean(fold_wss)
+  })
+  return(wss_values)
+}
+
+numeric_cols <- sapply(data, is.numeric)
+data1 <- data[, numeric_cols]
+data2 <- data_tsne[, 1:3]
+
+k_values <- 1:10
+
+wss_values1 <- cross_validate_kmeans(data1, k_values)
+wss_values2 <- cross_validate_kmeans(data2, k_values)
+
+wss_df1 <- data.frame(k = k_values, wss = wss_values1)
+wss_df2 <- data.frame(k = k_values, wss = wss_values2)
+```
+
+```{r}
+plot1 <- ggplot(wss_df1, aes(x = k, y = wss)) +
+  geom_line(color = "#2e86c1") +
+  geom_point(color = "#2e86c1") +
+  labs(title = "Original Data", x = "Number of Clusters (k)", y = "Within-Cluster Sum of Squares (WSS)") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   
+    axis.title = element_text(size = 18),  
+    plot.title = element_text(size = 24),  
+    aspect.ratio = 9/16                    
+  )
+
+plot2 <- ggplot(wss_df2, aes(x = k, y = wss)) +
+  geom_line(color = "#2e86c1") +
+  geom_point(color = "#2e86c1") +
+  labs(title = "Data t-SNE", x = "Number of Clusters (k)", y = "Within-Cluster Sum of Squares (WSS)") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   
+    axis.title = element_text(size = 18),  
+    plot.title = element_text(size = 24),  
+    aspect.ratio = 9/16                    
+  )
+
+combined_plots <- gridExtra::arrangeGrob(plot1, plot2, ncol = 2)
+
+grid.arrange(combined_plots)
+
+grid.arrange(plot1, plot2, ncol = 2)
+#ggsave("figures/kmeans_elbow.pdf", combined_plots, width = 16, height = 9, units = "in")
+```
+
+There isn't a clear winner. But we know our data set has 5 labels, so we will use that as the number of clusters.
+
+```{r}
+# plot k_means_tsn result in 3d
+kmeans_result <- kmeans(data1, centers = 5, nstart = 25)
+kmeans_result_tsne <- kmeans(data2, centers = 5, nstart = 25)
+
+plot_ly(data_tsne, x = ~V1, y = ~V2, z = ~V3, color = ~as.factor(kmeans_result_tsne$cluster), 
+        type = "scatter3d", mode = "markers", marker = list(size = 3)) %>%
+  layout(#title = "3D K-Means Clustering of WNBA Player Stats",
+         scene = list(xaxis = list(title = 'Dim 1'),
+                      yaxis = list(title = 'Dim 2'),
+                      zaxis = list(title = 'Dim 3')))
+```
+
+
+### DBSCAN
+
+```{r}
+cross_validate_dbscan <- function(data, eps_values, minPts_values, folds = 5) {
+  set.seed(42)
+  fold_indices <- createFolds(data[, 1], k = folds, list = TRUE, returnTrain = TRUE)
+  
+  results <- expand.grid(eps = eps_values, minPts = minPts_values)
+  results$silhouette <- NA
+  
+  for(i in 1:nrow(results)) {
+    eps <- results$eps[i]
+    minPts <- results$minPts[i]
+    
+    fold_silhouette <- sapply(fold_indices, function(indices) {
+      train_data <- data[indices, ]
+      dbscan_result <- dbscan(train_data, eps = eps, minPts = minPts)
+      
+      if(length(unique(dbscan_result$cluster)) > 1 && 
+         sum(dbscan_result$cluster == 0) < (nrow(train_data) - 1)) {
+        sil <- silhouette(dbscan_result$cluster, dist(train_data))
+        mean(sil[, 3])
+      } else {
+        return(NA)
+      }
+    })
+    
+    results$silhouette[i] <- mean(fold_silhouette, na.rm = TRUE)
+  }
+  
+  return(results)
+}
+
+eps_values <- seq(0.1, 1, by = 0.1)
+minPts_values <- 3:8
+
+results1 <- cross_validate_dbscan(data1, eps_values, minPts_values)
+results2 <- cross_validate_dbscan(data2, eps_values, minPts_values)
+```
+
+```{r}
+# Plot the results
+plot1 <- ggplot(results1, aes(x = eps, y = minPts, fill = silhouette)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#2e86c1", na.value = "grey90") +
+  labs(title = "Original Data",
+       x = "Epsilon", y = "MinPoints") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   
+    axis.title = element_text(size = 18),  
+    plot.title = element_text(size = 24),  
+    #aspect.ratio = 9/16                    
+  )
+
+plot2 <- ggplot(results2, aes(x = eps, y = minPts, fill = silhouette)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#2e86c1", na.value = "grey90") +
+  labs(title = "t-SNE Data",
+       x = "Epsilon", y = "MinPoints") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),   
+    axis.title = element_text(size = 18),  
+    plot.title = element_text(size = 24),  
+    #aspect.ratio = 9/16                    
+  )
+
+combined_plots <- gridExtra::arrangeGrob(plot1, plot2, ncol = 2)
+grid.arrange(combined_plots)
+#ggsave("figures/dbscan.pdf", combined_plots, width = 16, height = 9, units = "in")
+
+# Get best parameters
+best_params1 <- results1[which.max(results1$silhouette), ]
+best_params2 <- results2[which.max(results2$silhouette), ]
+
+cat("Best parameters for original data:\n",
+    "eps =", best_params1$eps, ", minPts =", best_params1$minPts,
+    "\nSilhouette score:", best_params1$silhouette, "\n\n")
+
+cat("Best parameters for t-SNE data:\n",
+    "eps =", best_params2$eps, ", minPts =", best_params2$minPts,
+    "\nSilhouette score:", best_params2$silhouette, "\n")
+```
+
+```{r}
+dbscan1 <- dbscan(data1, 
+                  eps = best_params1$eps, 
+                  minPts = best_params1$minPts)
+
+dbscan2 <- dbscan(data2, 
+                  eps = best_params2$eps, 
+                  minPts = best_params2$minPts)
+
+plot1 <- ggplot(data1, 
+                aes(x = X3PA, y = AST)) +
+  geom_point(aes(color = factor(dbscan1$cluster)), alpha = 0.7) +
+  labs(title = "DBSCAN Clusters (Original Data)", 
+       subtitle = paste("eps =", round(best_params1$eps, 2), 
+                       ", minPts =", best_params1$minPts,
+                       "\nSilhouette =", round(best_params1$silhouette, 3)),
+       color = "Cluster") +
+  theme_minimal()
+
+plot2 <- plot_ly(data.frame(data2),
+                 x = ~V1, y = ~V2, z = ~V3, 
+                 color = factor(dbscan2$cluster),
+                 type = "scatter3d", 
+                 mode = "markers",
+                 marker = list(size = 3)) %>%
+  layout(title = paste("DBSCAN Clusters (t-SNE Data)\n",
+                      "eps =", round(best_params2$eps, 2),
+                      ", minPts =", best_params2$minPts,
+                      ", Silhouette =", round(best_params2$silhouette, 3)))
+
+print(plot1)
+print(plot2)
+
+cat("\nOriginal Data - Number of clusters:", length(unique(dbscan1$cluster)) - 1, 
+    "\nNoise points:", sum(dbscan1$cluster == 0), "\n")
+cat("\nt-SNE Data - Number of clusters:", length(unique(dbscan2$cluster)) - 1, 
+    "\nNoise points:", sum(dbscan2$cluster == 0), "\n")
+```
+
+DBScan is not picking up any differences between the data, putting everything in the same cluster even when we did hyperparameter tuning. We saw initially how there's no significant spatial separation between the different player positions in our point cloud which are the cases this algorithm thrives in.
+
+### Hierarchical Clustering
+
+```{r}
+cross_validate_hclust <- function(
+    data, k_values, methods = c("complete", "average", "single", "ward.D2"), folds = 5) {
+  set.seed(42)
+  fold_indices <- createFolds(1:nrow(data), k = folds, list = TRUE, returnTrain = TRUE)
+  
+  results <- expand.grid(k = k_values, method = methods)
+  results$silhouette <- NA
+  
+  for(i in 1:nrow(results)) {
+    k <- results$k[i]
+    method <- as.character(results$method[i])
+    
+    fold_silhouette <- sapply(fold_indices, function(indices) {
+      train_data <- data[indices, ]
+      
+      dist_matrix <- dist(train_data, method = "euclidean")
+      hc <- hclust(dist_matrix, method = method)
+      clusters <- cutree(hc, k = k)
+      
+      if(length(unique(clusters)) > 1) {
+        sil <- silhouette(clusters, dist_matrix)
+        mean(sil[, 3])
+      } else {
+        return(NA)
+      }
+    })
+    
+    results$silhouette[i] <- mean(fold_silhouette, na.rm = TRUE)
+  }
+  
+  return(results)
+}
+
+data1 <- scale(data[, numeric_cols])
+data2 <- scale(data_tsne[, 1:3])
+
+k_values <- 2:10
+methods <- c("complete", "average", "single", "ward.D2")
+
+results1 <- cross_validate_hclust(data1, k_values, methods)
+results2 <- cross_validate_hclust(data2, k_values, methods)
+```
+
+```{r}
+plot1 <- ggplot(results1, aes(x = k, y = silhouette, color = method)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Original Data", 
+       x = "Number of Clusters (k)", 
+       y = "Silhouette Score") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 18),   
+    axis.title = element_text(size = 20),  
+    plot.title = element_text(size = 26),  
+    #aspect.ratio = 9/16                    
+  )
+
+plot2 <- ggplot(results2, aes(x = k, y = silhouette, color = method)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "t-SNE Data", 
+       x = "Number of Clusters (k)", 
+       y = "Silhouette Score") +
+  theme_minimal() +
+  theme(
+      axis.text = element_text(size = 18),   
+      axis.title = element_text(size = 20),  
+      plot.title = element_text(size = 26),  
+      #aspect.ratio = 9/16                    
+    )
+
+combined_plots <- gridExtra::arrangeGrob(plot1, plot2, ncol = 2)
+grid.arrange(combined_plots)
+#ggsave("figures/hierarchical_cv.pdf", combined_plots, width = 16, height = 9, units = "in")
+
+# Get best parameters
+best_params1 <- results1[which.max(results1$silhouette), ]
+best_params2 <- results2[which.max(results2$silhouette), ]
+
+cat("Best parameters for original data:\n",
+    "k =", best_params1$k, ", method =", best_params1$method,
+    "\nSilhouette score:", best_params1$silhouette, "\n\n")
+
+cat("Best parameters for t-SNE data:\n",
+    "k =", best_params2$k, ", method =", best_params2$method,
+    "\nSilhouette score:", best_params2$silhouette, "\n")
+```
+
+```{r}
+dist_matrix1 <- dist(data1, method = "euclidean")
+hc1 <- hclust(dist_matrix1, method = best_params1$method)
+clusters1 <- cutree(hc1, k = best_params1$k)
+
+dist_matrix2 <- dist(data2, method = "euclidean")
+hc2 <- hclust(dist_matrix2, method = best_params2$method)
+clusters2 <- cutree(hc2, k = best_params2$k)
+
+plot1 <- ggplot(data, 
+                aes(x = X3PA, y = AST)) +
+  geom_point(aes(color = factor(clusters1)), alpha = 0.7) +
+  labs(title = "Hierarchical Clusters (Original Data)", 
+       subtitle = paste("k =", best_params1$k, 
+                       ", method =", best_params1$method,
+                       "\nSilhouette =", round(best_params1$silhouette, 3)),
+       color = "Cluster") +
+  theme_minimal()
+
+plot2 <- plot_ly(data.frame(data_tsne), 
+                 x = ~V1, y = ~V2, z = ~V3, 
+                 color = factor(clusters2),
+                 type = "scatter3d", 
+                 mode = "markers",
+                 marker = list(size = 3)) %>%
+  layout(title = paste("Hierarchical Clusters (t-SNE Data)\n",
+                      "k =", best_params2$k,
+                      ", method =", best_params2$method,
+                      ", Silhouette =", round(best_params2$silhouette, 3)))
+
+print(plot1)
+print(plot2)
+
+cat("\nOriginal Data - Number of clusters:", length(unique(clusters1)), 
+    "\nCluster sizes:", table(clusters1), "\n")
+cat("\nt-SNE Data - Number of clusters:", length(unique(clusters2)), 
+    "\nCluster sizes:", table(clusters2), "\n")
+```
+
+```{r}
+par(mfrow = c(1, 2))
+plot(hc1, 
+     main = paste("Dendrogram (Original Data)\nMethod:", best_params1$method),
+     xlab = "", 
+     sub = "", 
+     cex = 0.6,
+     hang = -1) 
+rect.hclust(hc1, k = best_params1$k, border = "red")
+
+plot(hc2, 
+     main = paste("Dendrogram (t-SNE Data)\nMethod:", best_params2$method),
+     xlab = "", 
+     sub = "", 
+     cex = 0.6,
+     hang = -1)
+rect.hclust(hc2, k = best_params2$k, border = "red")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+par(mar = c(8, 4, 4, 2))
+
+plot(hc2, 
+     #main = paste("t-SNE Data)\nMethod:", best_params2$method),
+     xlab = "", 
+     sub = "", 
+     cex = 0.6,
+     hang = -1,
+     axes = FALSE,
+     labels = FALSE
+     )
+rect.hclust(hc2, k = best_params2$k, border = "#2e86c1")
+
+labels <- paste0(data_tsne$Player, "\n", data_tsne$Pos)[hc2$order]
+n_labels <- 16
+indices <- round(seq(1, length(hc2$order), length.out = n_labels))
+axis(1, at = indices, 
+     labels = labels[indices],
+     las = 2,      
+     srt = 70,     
+     cex.axis = 0.8)
+# Add y-axis
+axis(2)
+```
+```{r}
+# pdf("figures/dendrogram.pdf", width = 16, height = 9)
+# par(mar = c(12, 4, 4, 2))  # Increase bottom margin for labels
+# 
+# plot(hc2,
+#      main = "",
+#      xlab = "", 
+#      sub = "", 
+#      cex = 0.8,           # Base text size
+#      cex.main = 2,        # Title size
+#      cex.axis = 1.2,      # Axis text size
+#      cex.lab = 1.4,       # Axis labels size
+#      hang = -1,
+#      axes = FALSE,
+#      labels = FALSE
+# )
+# rect.hclust(hc2, k = best_params2$k, border = "#2e86c1")
+# 
+# # Add labels with increased size
+# labels <- paste0(data_tsne$Player, "\n", data_tsne$Pos)[hc2$order]
+# n_labels <- 16
+# indices <- round(seq(1, length(hc2$order), length.out = n_labels))
+# axis(1, 
+#      at = indices, 
+#      labels = labels[indices],
+#      las = 2,      
+#      cex.axis = 1.2,     # Increase label size
+#      padj = 0.5)         # Adjust label position
+# # Add y-axis
+# axis(2, cex.axis = 1.2)  # Increase y-axis label size
+# 
+# dev.off()
+```  
+
+### Gaussian Mixture Models (GMMs)
+
+```{r}
+cross_validate_gmm <- function(data, G_values, folds = 5) {
+  set.seed(42)
+  fold_indices <- createFolds(1:nrow(data), k = folds, list = TRUE, returnTrain = TRUE)
+  
+  results <- data.frame(G = G_values, bic = NA)
+  
+  for(i in seq_along(G_values)) {
+    G <- G_values[i]
+    
+    # Calculate BIC scores across folds
+    fold_bic <- sapply(fold_indices, function(indices) {
+      train_data <- data[indices, ]
+      gmm <- Mclust(train_data, G = G)
+      return(gmm$bic)
+    })
+    
+    results$bic[i] <- mean(fold_bic)
+  }
+  
+  return(results)
+}
+
+data1 <- scale(data[, numeric_cols])
+data2 <- scale(data_tsne[, 1:3])
+
+G_values <- 1:10
+
+results1 <- cross_validate_gmm(data1, G_values)
+results2 <- cross_validate_gmm(data2, G_values)
+
+plot1 <- ggplot(results1, aes(x = G, y = bic)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "GMM Model Selection\n(Original Data)", 
+       x = "Number of Components", 
+       y = "BIC Score") +
+  theme_minimal()
+
+plot2 <- ggplot(results2, aes(x = G, y = bic)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "GMM Model Selection\n(t-SNE Data)", 
+       x = "Number of Components", 
+       y = "BIC Score") +
+  theme_minimal()
+
+grid.arrange(plot1, plot2, ncol = 2)
+
+best_G1 <- G_values[which.min(results1$bic)]
+best_G2 <- G_values[which.min(results2$bic)]
+```
+
+```{r}
+# Plot results with improved styling
+# plot1 <- ggplot(results1, aes(x = G, y = bic)) +
+#   geom_line(color = "#2e86c1", size = 1.5) +
+#   geom_point(color = "#2e86c1", size = 3) +
+#   labs(title = "Original Data", 
+#        x = "Number of Components", 
+#        y = "BIC Score") +
+#   theme_minimal() +
+#   scale_y_continuous(labels = function(x) format(x/1000, scientific = FALSE, big.mark = ",", suffix = "k")) +
+#   theme(
+#     axis.text = element_text(size = 16),   # Axis numbers
+#     axis.title = element_text(size = 18),  # Axis titles
+#     plot.title = element_text(size = 24),  # Plot title
+#     aspect.ratio = 9/16                    # Force 16:9 aspect ratio
+#   )
+# 
+# plot2 <- ggplot(results2, aes(x = G, y = bic)) +
+#   geom_line(color = "#2e86c1", size = 1.5) +
+#   geom_point(color = "#2e86c1", size = 3) +
+#   labs(title = "t-SNE Data", 
+#        x = "Number of Components", 
+#        y = "BIC Score") +
+#   theme_minimal() +
+#   scale_y_continuous(labels = function(x) format(x/1000, scientific = FALSE, big.mark = ",", suffix = "k")) +
+#   theme(
+#     axis.text = element_text(size = 16),   
+#     axis.title = element_text(size = 18),  
+#     plot.title = element_text(size = 24),  
+#     aspect.ratio = 9/16                    
+#   )
+# 
+# # Combine plots and save
+# combined_plots <- gridExtra::arrangeGrob(plot1, plot2, ncol = 2)
+# grid.arrange(combined_plots)
+# ggsave("figures/gmm_cv.pdf", combined_plots, width = 16, height = 6, units = "in")
+```
+
+```{r}
+gmm1 <- Mclust(data1, G = best_G1)
+gmm2 <- Mclust(data2, G = best_G2)
+
+plot1 <- ggplot(data, 
+                aes(x = X3PA, y = X2P.)) +
+  geom_point(aes(color = factor(gmm1$classification)), alpha = 0.7) +
+  labs(title = "GMM Clusters (Original Data)", 
+       subtitle = paste("Components =", best_G1,
+                       "\nBIC =", round(min(results1$bic), 2)),
+       color = "Cluster") +
+  theme_minimal()
+
+plot2 <- plot_ly(data.frame(data_tsne), 
+                 x = ~V1, y = ~V2, z = ~V3, 
+                 color = factor(gmm2$classification),
+                 type = "scatter3d", 
+                 mode = "markers",
+                 marker = list(size = 3)) %>%
+  layout(title = paste("GMM Clusters (t-SNE Data)\n",
+                      "Components =", best_G2,
+                      "\nBIC =", round(min(results2$bic), 2)))
+
+print(plot1)
+print(plot2)
+
+cat("\nOriginal Data - Number of components:", best_G1, 
+    "\nCluster sizes:", table(gmm1$classification), "\n")
+cat("\nt-SNE Data - Number of components:", best_G2, 
+    "\nCluster sizes:", table(gmm2$classification), "\n")
+```
+
+## Results
+
+```{r}
+true_labels <- as.numeric(as.factor(data$Pos))
+true_labels_tsne <- as.numeric(as.factor(data_tsne$Pos))
+
+homogeneity_kmeans1 <- NMI(true_labels, kmeans_result$cluster)
+homogeneity_dbscan1 <- NMI(true_labels, dbscan1$cluster)
+homogeneity_hclust1 <- NMI(true_labels, clusters1)
+homogeneity_gmm1 <- NMI(true_labels, gmm1$classification)
+
+homogeneity_kmeans2 <- NMI(true_labels_tsne, kmeans_result_tsne$cluster)
+homogeneity_dbscan2 <- NMI(true_labels_tsne, dbscan2$cluster)
+homogeneity_hclust2 <- NMI(true_labels_tsne, clusters2)
+homogeneity_gmm2 <- NMI(true_labels_tsne, gmm2$classification)
+
+results_df <- data.frame(
+  Method = c("K-means", "DBSCAN", "Hierarchical", "GMM"),
+  Original_Data = c(homogeneity_kmeans1, homogeneity_dbscan1, 
+                   homogeneity_hclust1, homogeneity_gmm1),
+  TSNE_Data = c(homogeneity_kmeans2, homogeneity_dbscan2, 
+                homogeneity_hclust2, homogeneity_gmm2)
+)
+
+print("Homogeneity Scores:")
+print(results_df)
+
+results_long <- tidyr::pivot_longer(results_df, 
+                                  cols = c("Original_Data", "TSNE_Data"),
+                                  names_to = "Dataset",
+                                  values_to = "Score")
+
+plot <- ggplot(results_long, aes(x = Method, y = Score, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(#title = "Clustering Methods Comparison",
+       y = "Homogeneity Score",
+       x = "Clustering Method") +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    plot.title = element_text(size = 24),
+    aspect.ratio = 9/16
+  )
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(plot)
+#ggsave("figures/homogeneity_scores.pdf", plot, width = 16, height = 9, units = "in")
+```
+
+
+```{r}
+data_tsne$cluster <- kmeans_result_tsne$cluster
+
+cluster_means <- data_tsne %>%
+  group_by(cluster) %>%
+  summarize(across(c("V1", "V2", "V3"), mean)) %>%
+  ungroup()
+
+cluster_matrix <- as.matrix(cluster_means[, -1])
+rownames(cluster_matrix) <- paste("Cluster", cluster_means$cluster)
+
+scaled_matrix <- scale(cluster_matrix)
+
+pheatmap(scaled_matrix,
+         main = "Cluster Profiles - K-means on t-SNE Data",
+         angle_col = 45,
+         display_numbers = TRUE,
+         number_format = "%.1f",
+         fontsize_number = 7,
+         cluster_rows = FALSE,  # Don't cluster the rows
+         cluster_cols = TRUE)   # Allow clustering of features
+```
+
+```{r}
+data$cluster <- kmeans_result$cluster
+
+cluster_means <- data %>%
+  group_by(cluster) %>%
+  summarize(across(head(names(numeric_cols)[numeric_cols], -1), mean)) %>%
+  ungroup()
+
+cluster_matrix <- as.matrix(cluster_means[, -1])
+rownames(cluster_matrix) <- paste("Cluster", cluster_means$cluster)
+
+scaled_matrix <- scale(cluster_matrix)
+
+pheatmap(scaled_matrix,
+         main = "",
+         angle_col = 45,
+         display_numbers = TRUE,
+         number_format = "%.1f",
+         fontsize_number = 8,
+         cluster_rows = FALSE,  
+         cluster_cols = TRUE,
+         legend = FALSE,
+         #filename = "figures/final_heatmap.pdf"
+         )
+```
+
+```{r}
+# For t-SNE data k-means clusters
+cluster_positions <- data_tsne %>%
+  group_by(cluster) %>%
+  count(Pos) %>%
+  arrange(cluster, desc(n)) %>%
+  group_by(cluster) %>%
+  slice(1) %>%
+  ungroup()
+
+print("Majority positions in t-SNE k-means clusters:")
+print(cluster_positions)
+
+# For original data k-means clusters
+cluster_positions_orig <- data %>%
+  group_by(cluster) %>%
+  count(Pos) %>%
+  arrange(cluster, desc(n)) %>%
+  group_by(cluster) %>%
+  slice(1) %>%
+  ungroup()
+
+print("\nMajority positions in original data k-means clusters:")
+print(cluster_positions_orig)
+
+# Optional: Add percentages
+cluster_details <- data_tsne %>%
+  group_by(cluster) %>%
+  summarise(
+    majority_pos = names(which.max(table(Pos))),
+    majority_count = max(table(Pos)),
+    total_count = n(),
+    percentage = round(max(table(Pos)) / n() * 100, 1)
+  )
+
+print("\nDetailed cluster composition (t-SNE):")
+print(cluster_details)
+```
